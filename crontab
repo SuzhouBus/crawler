@@ -1,0 +1,5 @@
+# Example crontab file for the crawlers. Modify according to your needs.
+
+# m h dom mon dow user	command
+15,45 5-23 * * * root /home/bus/crawl_buses_sz3.sh 1-selected.guid
+* 5-21 * * * root /home/bus/crawl_buses_sz_new.sh
