@@ -1,11 +1,35 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import datetime, os.path, sys
+import sys
+reload(sys)
+sys.setdefaultencoding("utf-8")
 
-COLOR = (106, 90, 205)
-WHITE = (255, 255, 255)
-DATA_HEADER = 'var __BUS_LINE_DATA='
+import datetime, json, os.path, signal
+
+DIR = os.path.dirname(__file__)
+JS_DATA_HEADER = 'var __BUS_LINE_DATA='
+INCREMENTAL_STATE_FILE='_last_known_state.json'
+PROCESSED_DATA_FILE='_last_processed_data.json'
+
+_Verbose = 0
+_CtrlC = 0
+
+def _CtrlCHandler(signal, frame):
+  global _CtrlC
+  _CtrlC += 1
+
+signal.signal(signal.SIGINT, _CtrlCHandler)
+
+def _CompareDate(date1, date2):
+  date1 = tuple(int(x) for x in date1.split('-'))
+  date2 = tuple(int(x) for x in date2.split('-'))
+
+  if date1 < date2:
+    return -1
+  if date1 > date2:
+    return 1
+  return 0
 
 def _GetPreviousDate(date):
   if _GetPreviousDate.cache.get(date) is None:
@@ -15,12 +39,36 @@ def _GetPreviousDate(date):
 
 _GetPreviousDate.cache = {}
 
+def _LoadIncrementalState():
+  path_state = os.path.join(DIR, INCREMENTAL_STATE_FILE)
+  path_data = os.path.join(DIR, PROCESSED_DATA_FILE)
+  if os.path.isfile(path_state) and os.path.isfile(path_data):
+    with open(path_state, 'r') as state_file:
+      with open(path_data, 'r') as data_file:
+        return (json.load(state_file), json.load(data_file))
+
+  if _Verbose:
+    sys.stderr.write('Incremental state file does not exist. Doing a full parse...\n')
+  return ({}, {})
+
+def _SaveIncrementalState(state, data):
+  try:
+    with open(os.path.join(DIR, INCREMENTAL_STATE_FILE), 'w') as state_file:
+      with open(os.path.join(DIR, PROCESSED_DATA_FILE), 'w') as data_file:
+        json.dump(state, state_file, separators=(',', ':'), sort_keys=True)
+        json.dump(data, data_file, separators=(',', ':'), sort_keys=True)
+  except:
+    if _Verbose:
+      sys.stderr.write('Error saving incremental state file.\n')
+
 if __name__ == '__main__':
   if len(sys.argv) <= 1:
-    print 'Usage: sz_buses_parser.py <line...>'
+    print 'Usage: sz_buses_parser.py [-v|--verbose] [-i|--incremental] <line...>'
     sys.exit()
 
-  verbose = False
+  incremental = False
+  incremental_state = {}
+  processed_data = {}
 
   buses_map = {}
   with open('buses', 'r') as f:
@@ -30,41 +78,22 @@ if __name__ == '__main__':
         buses_map[values[1]] = values[0]
 
 #  print '''<!doctype html>
-  '''<html>
-  <head>
-    <meta charset="utf-8">
-    <title>Buses</title>
-    <style>
-      col.bus_id {
-        background-color: LightGoldenRodYellow;
-      }
-      col.direction_0 {
-        background-color: PaleTurquoise;
-      }
-      col.direction_1 {
-        background-color: Plum;
-      }
-
-      #contents {
-        column-count: 4;
-        column-rule: 1px solid grey;
-        column-gap: 5em;
-      }
-
-      td.active {
-        background-color: SkyBlue;
-      }
-
-      th, td:nth-child(1) {
-        white-space: nowrap;
-      }
-    </style>'''
-
   lines = []
   for line in sys.argv[1:]:
-    if line == '-v' or line == '--verbose':
-      verbose = True
-      continue
+    if line.startswith('-'):
+      if line == '-v' or line == '--verbose' or line == '-V1':
+        _Verbose = 1
+        continue
+      if line == '-V' or line == '-V2':
+        _Verbose = 2
+        continue
+      if line == '-V3':
+        _Verbose = 3
+        continue
+      if line == '-i' or line == '--incremental':
+        incremental = True
+        incremental_state, processed_data = _LoadIncrementalState()
+        continue
 
     linefile = line
     if not os.path.isfile(linefile) and os.path.isfile('%s.csv' % linefile):
@@ -75,25 +104,79 @@ if __name__ == '__main__':
     lines.append((line, linefile))
 
 #  print '<script type="application/json" id="lineData">{'
-  sys.stdout.write(DATA_HEADER)
+  sys.stdout.write(JS_DATA_HEADER)
   sys.stdout.write('JSON.parse(\'{')
-  first = True
-  for line, linefile in lines:
-    if first:
-      first = False
-    else:
-      sys.stdout.write(',')
-    sys.stdout.write('\\\n"%s":{"details":[' % line)
 
+  first = True
+
+  for line, linefile in lines:
+    current_date = None
+    previous_date = None
+    last_fp = 0
+    previous_date_ending_fp = 0
+    fp_frozen = False
+    processed_lines = set()
     night_line = ( line[0:1].upper() == 'N')
     running_buses = dict()
     running_buses_set = set()
+
+    if _Verbose >= 3:
+      sys.stderr.write('Parsing %s...\n' % linefile)
+
     with open(linefile, 'r') as f:
-      for l in set(f.readlines()):
+      file_size = os.path.getsize(linefile)
+      if incremental_state.get(linefile) is not None:
+        state = incremental_state[linefile]
+        if file_size >= state['size']:
+          if processed_data.get(line) is not None:
+            running_buses = processed_data[line]['running_buses']
+            running_buses_set = set(processed_data[line]['running_buses_set'])
+            f.seek(state['fp'])
+
+            if _Verbose >= 3:
+              sys.stderr.write('Incrementally processing %s beginning at offset %s, after date %s\n' % (linefile, state['fp'], state['date']))
+          elif _Verbose:
+            sys.stderr.write('Incomplete incremental state for line %s.\n' % line)
+        elif _Verbose:
+          sys.stderr.write('The size of file %s has shrunk and it has to be fully parsed.\n' % linefile)
+
+      while True:
+        last_fp = f.tell()
+        l = f.readline()
+        if len(l) == 0:
+          break
+        if l in processed_lines:
+          continue
+        processed_lines.add(l)
+
         values = l.rstrip('\r\n').split(',')
         if len(values) >= 5:
           date = values[4]
           time = values[3]
+
+          if len(date) == 0 and current_date is not None:
+            date = current_date
+          if current_date is None:
+            current_date = date
+          elif current_date != date and not fp_frozen:
+            if _CompareDate(date, current_date) > 0:
+              if incremental_state.get(linefile) is None:
+                incremental_state[linefile] = {}
+              incremental_state[linefile]['size'] = file_size
+              previous_date = current_date
+              incremental_state[linefile]['date'] = current_date
+              previous_date_ending_fp = last_fp
+              incremental_state[linefile]['fp'] = last_fp
+              current_date = date
+              if processed_data.get(line) is None:
+                processed_data[line] = {}
+              processed_data[line]['running_buses'] = running_buses
+              processed_data[line]['running_buses_set'] = list(running_buses_set)
+            else:
+              fp_frozen = True
+              if _Verbose:
+                sys.stderr.write('Data is not ordered chronologically for line %s: %s after %s\n' % (line, date, current_date))
+
           # For night lines, |date| means the date of the night when the first bus appears.
           if night_line and ':' in time and int(time.split(':')[0]) < 12:
             date = _GetPreviousDate(date)
@@ -109,19 +192,42 @@ if __name__ == '__main__':
               running_buses[date][bus_id] =  1
             else:
               running_buses[date][bus_id] += 1
-        elif verbose:
-          sys.stderr.write('Skipped invalid entry for %s: %s\n' % (line, l))
+        elif _Verbose >= 2:
+          pass
+          #sys.stderr.write('Skipped invalid entry for %s: %s' % (line, l)) # |l| has a trailing '\n'.
 
-    sorted_running_buses = sorted(running_buses_set, key=lambda x:buses_map.get(x, 'Z%s' % x))
+    if len(running_buses) > 0:
+      sorted_running_buses = sorted(running_buses_set, key=lambda x:buses_map.get(x, 'Z%s' % x))
 
-    sys.stdout.write(',\\\n'.join([
-      '["%s",[%s]]' % (date,
-        ','.join([str(round(float(buses.get(bus_id, 0)) / max(buses.values()), 3))
-          for bus_id in sorted_running_buses]))
-      for date, buses in sorted(running_buses.iteritems(), key=lambda x:x[0])])
-    )
-    sys.stdout.write('\\\n],"buses":[%s]}' % ','.join(['{"busId":"%s","licenseId":"%s"}' % (buses_map.get(x, ''), x) for x in sorted_running_buses]))
+      if first:
+        first = False
+      else:
+        sys.stdout.write(',')
+      sys.stdout.write('\\\n"%s":{"details":[' % line)
+
+      sys.stdout.write(',\\\n'.join([
+        '["%s",[%s]]' % (date,
+          ','.join([str(round(float(buses.get(bus_id, 0)) / max(buses.values()), 3))
+            for bus_id in sorted_running_buses]))
+        for date, buses in sorted(running_buses.iteritems(), key=lambda x:x[0])])
+      )
+      sys.stdout.write('\\\n],"buses":[%s]}' % ','.join(['{"busId":"%s","licenseId":"%s"}' % (buses_map.get(x, ''), x.encode('utf-8')) for x in sorted_running_buses]))
+
+    elif _Verbose:
+      sys.stderr.write('Skipped line with empty data: %s\n' % line)
+
+    if _CtrlC:
+      sys.stderr.write('\nCtrl-C pressed. Aborting...\n')
+      break
+
   print '}\')'
+
+  if incremental:
+    _SaveIncrementalState(incremental_state, processed_data)
+
+
+
+
 #  print '''}</script>
   '''    <script>
       var COLOR = [106, 90, 205];
@@ -372,3 +478,33 @@ if __name__ == '__main__':
     <div id="content"></div>
   </body>
 </html>'''
+  '''<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Buses</title>
+    <style>
+      col.bus_id {
+        background-color: LightGoldenRodYellow;
+      }
+      col.direction_0 {
+        background-color: PaleTurquoise;
+      }
+      col.direction_1 {
+        background-color: Plum;
+      }
+
+      #contents {
+        column-count: 4;
+        column-rule: 1px solid grey;
+        column-gap: 5em;
+      }
+
+      td.active {
+        background-color: SkyBlue;
+      }
+
+      th, td:nth-child(1) {
+        white-space: nowrap;
+      }
+    </style>'''
+
