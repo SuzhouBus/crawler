@@ -21,11 +21,13 @@ grep -v '^#\|^$' "$guid_file" | (
     echo $line
 
     line_count=$((line_count + 1))
+    direction_id=0
     for guid in `echo "$entry" | cut -d ' ' -f 2-`; do
       echo $guid
       results=$(wget -q -O /dev/stdout "http://www.szjt.gov.cn/BusQuery/APTSLine.aspx?LineGuid=$guid" | "$dir/parse_sz_html.sh")
-      echo "$results" | grep -v ',,$' | sed s/\$/,$(date +%Y-%m-%d)/ >> "$csv_file"
+      echo "$results" | grep -v ',,$' | sed s/\$/,$(date +%Y-%m-%d),"$direction_id"/ >> "$csv_file"
       buses=`echo "$results" | cut -d , -f 3 | grep -v '^$'`
+      direction_id=$((direction_id + 1))
       sleep 0.9
 
       for bus in $buses; do
